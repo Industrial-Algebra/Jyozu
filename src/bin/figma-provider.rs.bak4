@@ -1,0 +1,1072 @@
+use anyhow::{Result, anyhow};
+use clap::{Parser, Subcommand};
+use serde::{Serialize};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+use futures::stream::StreamExt;
+use futures::sink::SinkExt;
+use uuid::Uuid;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Figma Provider for Lonis harness
+#[derive(Parser)]
+#[command(name = "figma-provider")]
+#[command(about = "Lonis-compatible Figma provider", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Show provider manifest
+    Manifest,
+    /// List available tools
+    ToolsList,
+    /// Describe a specific tool
+    ToolsDescribe {
+        /// Tool name
+        #[arg(value_name = "TOOL")]
+        tool: String,
+    },
+    /// Call a tool with JSON arguments
+    Call {
+        /// Tool name
+        #[arg(value_name = "TOOL")]
+        tool: String,
+        /// JSON arguments
+        #[arg(value_name = "ARGS")]
+        args: Value,
+    },
+    /// Show provider status
+    Status,
+    /// Run provider diagnostics
+    Doctor,
+}
+
+#[derive(Serialize)]
+struct Manifest {
+    provider: ProviderInfo,
+    tools: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ProviderInfo {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
+struct ToolDescription {
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Manifest => {
+            let manifest = Manifest {
+                provider: ProviderInfo {
+                    name: "figma".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                tools: get_tool_names(),
+            };
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
+        Commands::ToolsList => {
+            let tools = get_tool_names();
+            println!("{}", serde_json::to_string_pretty(&tools)?);
+        }
+        Commands::ToolsDescribe { tool } => {
+            if let Some(desc) = get_tool_description(&tool) {
+                println!("{}", serde_json::to_string_pretty(&desc)?);
+            } else {
+                eprintln!("Tool not found: {}", tool);
+                std::process::exit(1);
+            }
+        }
+        Commands::Call { tool, args } => {
+            // Validate args is an object and has a channel string
+            let args_obj = args.as_object().ok_or_else(|| anyhow::anyhow!("Arguments must be a JSON object"))?;
+            let channel_val = args_obj.get("channel").ok_or_else(|| anyhow::anyhow!("Missing required 'channel' argument"))?;
+            let channel_str = channel_val.as_str().ok_or_else(|| anyhow::anyhow!("'channel' must be a string"))?;
+            
+            // Remove channel from args for the plugin command
+            let mut params = serde_json::Map::new();
+            for (k, v) in args_obj {
+                if k != "channel" {
+                    params.insert(k.clone(), v.clone());
+                }
+            }
+            
+            // Generate a request ID for this call
+            let request_id = Uuid::new_v4().to_string();
+            
+            // Set up WebSocket server
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+            let result = rt.block_on(async {
+                // Listen on localhost:3055
+                let addr = "127.0.0.1:3055";
+                let listener = tokio::net::TcpListener::bind(addr).await?;
+                println!("Listening for Figma plugin on ws://{}", addr);
+                
+                // Accept a connection
+                let (tcp_stream, _) = listener.accept().await?;
+                let ws_stream = accept_async(tcp_stream).await?;
+                println!("WebSocket connection established");
+                
+                // Split the WebSocket stream
+                let (mut ws_send, mut ws_recv) = ws_stream.split();
+                
+                // Wait for join request (timeout after 10 seconds)
+                let join_future = async {
+                    while let Some(msg) = ws_recv.next().await {
+                        let msg = msg?;
+                        if let Message::Text(text) = msg {
+                            let envelope: serde_json::Value = serde_json::from_str(&text)?;
+                            let msg_type = envelope.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if msg_type == "join" {
+                                // Extract sessionId from payload
+                                let payload = envelope.get("payload").and_then(|v| v.as_object()).unwrap_or(&serde_json::Map::new());
+                                let session_id = payload.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                                if !session_id.is_empty() {
+                                    println!("Plugin joined channel: {}", session_id);
+                                    // Send join ack
+                                    let timestamp = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .expect("Time went backwards")
+                                        .as_millis() as i64;
+                                    let ack = serde_json::json!({
+                                        "id": envelope.get("id").unwrap_or(&serde_json::Value::Null),
+                                        "type": "ack",
+                                        "channel": session_id,
+                                        "timestamp": timestamp,
+                                        "payload": {
+                                            "kind": "join",
+                                            "ok": true,
+                                            "sessionId": session_id
+                                        }
+                                    });
+                                    ws_send.send(Message::Text(serde_json::to_string(&ack)?)).await?;
+                                    return Ok(session_id);
+                                }
+                            }
+                        }
+                    }
+                    Err(anyhow::anyhow!("No join request received"))
+                };
+                
+                let joined_channel = match tokio::time::timeout(std::time::Duration::from_secs(10), join_future).await {
+                    Ok(res) => res?,
+                    Err(_) => return Err(anyhow::anyhow!("Timeout waiting for plugin to join channel")),
+                };
+                
+                // Use the channel from the join request (should match the args channel)
+                let channel_to_use = joined_channel;
+                
+                // Send command message
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_millis() as i64;
+                let command_envelope = serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "type": "message",
+                    "channel": channel_to_use,
+                    "timestamp": timestamp,
+                    "payload": {
+                        "command": tool,
+                        "params": params
+                    }
+                });
+                ws_send.send(Message::Text(serde_json::to_string(&command_envelope)?)).await?;
+                println!("Sent command: {}", tool);
+                
+                // Wait for response (timeout after 30 seconds)
+                let response_future = async {
+                    while let Some(msg) = ws_recv.next().await {
+                        let msg = msg?;
+                        if let Message::Text(text) = msg {
+                            let envelope: serde_json::Value = serde_json::from_str(&text)?;
+                            let msg_type = envelope.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if msg_type == "message" {
+                                let payload = envelope.get("payload").and_then(|v| v.as_object()).unwrap_or(&serde_json::Map::new());
+                                let resp_request_id = payload.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+                                if resp_request_id == request_id {
+                                    // Found our response
+                                    let result = payload.get("result").cloned();
+                                    let error = payload.get("error").cloned();
+                                    if let Some(err) = error {
+                                        let err_msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+                                        return Err(anyhow::anyhow!("Plugin error: {}", err_msg));
+                                    }
+                                    return Ok(result.unwrap_or(serde_json::Value::Null));
+                                }
+                            }
+                        }
+                    }
+                    Err(anyhow::anyhow!("No response received from plugin"))
+                };
+                
+                let res = match tokio::time::timeout(std::time::Duration::from_secs(30), response_future).await {
+                    Ok(res) => res?,
+                    Err(_) => return Err(anyhow::anyhow!("Timeout waiting for plugin response")),
+                };
+                
+                Ok(res)
+            });
+            
+            match result {
+                Ok(res) => {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Status => {
+            let status = json!({ "status": "ok" });
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Commands::Doctor => {
+            let doctor = json!({
+                "status": "ok",
+                "checks": {
+                    "figma_connection": {
+                        "status": "unknown",
+                        "detail": "Not implemented"
+                    }
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&doctor)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn get_tool_description(tool: &str) -> Option<ToolDescription> {
+    match tool {
+        "join_channel" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Connect to a Figma plugin channel. Required before using other tools.".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "url": { "type": "string" } } }),
+            });
+        }
+        "get_page_info" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get information about a specific page or the current page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" } } }),
+            });
+        }
+        "get_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get the currently selected nodes in Figma".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "includeGeometry": { "type": "boolean" } } }),
+            });
+        }
+        "set_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the current selection to specific nodes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } } } }),
+            });
+        }
+        "get_node_info" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get detailed information about a specific node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "includeChildren": { "type": "string" } } }),
+            });
+        }
+        "find_nodes_by_name" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Find nodes by name pattern".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "type": { "type": "string" } } }),
+            });
+        }
+        "create_frame" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new frame with optional auto-layout".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" }, "parentId": { "type": "string" }, "layoutMode": { "type": "string" }, "padding": { "type": "number" }, "gap": { "type": "number" } } }),
+            });
+        }
+        "create_rectangle" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new rectangle".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_ellipse" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new ellipse or circle".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_text" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new text node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "text": { "type": "string" }, "fontSize": { "type": "number" }, "fontColor": { "type": "object" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_line" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new line".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x1": { "type": "string" }, "y1": { "type": "string" }, "x2": { "type": "string" }, "y2": { "type": "string" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "delete_node" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Delete a node. Requires MCP server startup with --allow-destructive-tools and confirm=true".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "confirm": { "type": "boolean" }, "dryRun": { "type": "boolean" }, "reason": { "type": "string" } } }),
+            });
+        }
+        "set_node_name" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Rename a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "name": { "type": "string" } } }),
+            });
+        }
+        "move_node" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Move a node to a new position".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" } } }),
+            });
+        }
+        "resize_node" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Resize a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "width": { "type": "number" }, "height": { "type": "number" } } }),
+            });
+        }
+        "set_fill" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the fill color of a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "color": { "type": "object" }, "opacity": { "type": "string" } } }),
+            });
+        }
+        "set_stroke" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the stroke/border of a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "color": { "type": "object" }, "weight": { "type": "string" } } }),
+            });
+        }
+        "set_corner_radius" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set corner radius for a rectangle or frame".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "radius": { "type": "number" }, "topLeft": { "type": "string" }, "topRight": { "type": "string" }, "bottomLeft": { "type": "string" }, "bottomRight": { "type": "string" } } }),
+            });
+        }
+        "set_effects" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Add effects like drop shadows to a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "dropShadow": { "type": "string" }, "innerShadow": { "type": "string" } } }),
+            });
+        }
+        "set_auto_layout" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Enable or modify auto-layout on a frame".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "layoutMode": { "type": "string" }, "padding": { "type": "number" }, "gap": { "type": "number" }, "alignment": { "type": "string" } } }),
+            });
+        }
+        "reorder_children" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Reorder children within a parent node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "parentId": { "type": "string" }, "childIds": { "type": "array", "items": { "type": "string" } } } }),
+            });
+        }
+        "create_component" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Convert selected nodes into a reusable component".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "name": { "type": "string" }, "description": { "type": "string" } } }),
+            });
+        }
+        "create_component_set" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Combine multiple components into a component set with variants".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "componentIds": { "type": "array", "items": { "type": "string" } }, "name": { "type": "string" }, "propertyName": { "type": "string" } } }),
+            });
+        }
+        "create_instance" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create an instance from a component".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "componentId": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "detach_instance" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Detach an instance to make it editable".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "instanceId": { "type": "string" } } }),
+            });
+        }
+        "swap_component" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Swap an instance to use a different component".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "instanceId": { "type": "string" }, "newComponentId": { "type": "string" } } }),
+            });
+        }
+        "reset_instance" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Reset all overrides on an instance to match the component".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "instanceId": { "type": "string" } } }),
+            });
+        }
+        "set_component_property" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set a variant property on a component instance".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "instanceId": { "type": "string" }, "propertyName": { "type": "string" }, "value": { "type": "string" } } }),
+            });
+        }
+        "set_constraints" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set resize constraints for responsive design".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "horizontal": { "type": "string" }, "vertical": { "type": "string" } } }),
+            });
+        }
+        "set_layout_grow" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set grow and shrink behavior in auto-layout".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "grow": { "type": "string" }, "shrink": { "type": "string" } } }),
+            });
+        }
+        "export_node" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Export a node as an image or vector file".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "format": { "type": "string" }, "scale": { "type": "string" }, "suffix": { "type": "string" } } }),
+            });
+        }
+        "export_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Export the current selection".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "format": { "type": "string" }, "scale": { "type": "string" } } }),
+            });
+        }
+        "boolean_union" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Merge multiple shapes into one".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "boolean_subtract" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Subtract shapes from the first shape".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "boolean_intersect" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Keep only the overlapping area of shapes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "boolean_exclude" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Remove the overlapping area of shapes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "flatten_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Flatten vector nodes into a single layer".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } } } }),
+            });
+        }
+        "outline_stroke" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Convert a stroke to a vector outline".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "group_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Group multiple nodes together".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "name": { "type": "string" } } }),
+            });
+        }
+        "ungroup" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Ungroup a group".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "groupId": { "type": "string" } } }),
+            });
+        }
+        "wrap_in_frame" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Wrap nodes in a new frame".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "name": { "type": "string" }, "padding": { "type": "number" } } }),
+            });
+        }
+        "bring_to_front" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Bring node to front of layer stack".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "send_to_back" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Send node to back of layer stack".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "bring_forward" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Bring node forward one layer".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "send_backward" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Send node backward one layer".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "set_text_content" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Update the text content of a text node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "text": { "type": "string" } } }),
+            });
+        }
+        "set_font" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Change the font family and style".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "family": { "type": "string" }, "style": { "type": "string" } } }),
+            });
+        }
+        "set_font_size" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Change the font size".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "fontSize": { "type": "number" } } }),
+            });
+        }
+        "set_font_weight" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Change the font weight".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "fontWeight": { "type": "number" } } }),
+            });
+        }
+        "set_line_height" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the line height/leading".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "lineHeight": { "type": "number" } } }),
+            });
+        }
+        "set_letter_spacing" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the letter spacing (tracking)".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "letterSpacing": { "type": "number" } } }),
+            });
+        }
+        "set_paragraph_spacing" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set the spacing between paragraphs".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "paragraphSpacing": { "type": "number" } } }),
+            });
+        }
+        "set_text_alignment" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set text alignment (horizontal and/or vertical)".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "horizontal": { "type": "string" }, "vertical": { "type": "string" } } }),
+            });
+        }
+        "set_text_decoration" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set text decoration (underline, strikethrough)".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "decoration": { "type": "string" } } }),
+            });
+        }
+        "set_text_case" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set text case transformation".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "textCase": { "type": "string" } } }),
+            });
+        }
+        "set_text_auto_resize" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set text auto resize behavior".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "autoResize": { "type": "string" } } }),
+            });
+        }
+        "set_text_hyperlink" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Add a hyperlink to text or a range of text".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "url": { "type": "string" }, "start": { "type": "string" }, "end": { "type": "string" } } }),
+            });
+        }
+        "get_font_list" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get list of available fonts in the document. Returns a summarized preview instead of dumping the full font catalog into the MCP response.".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "familyContains": { "type": "string" }, "styleContains": { "type": "string" }, "limit": { "type": "string" } } }),
+            });
+        }
+        "create_vector" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a custom vector shape from SVG path data".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "path": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_polygon" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a polygon with N sides".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "radius": { "type": "number" }, "sides": { "type": "string" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_star" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a star shape".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "outerRadius": { "type": "string" }, "innerRadius": { "type": "string" }, "points": { "type": "string" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_arrow" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create an arrow line with arrowhead".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x1": { "type": "string" }, "y1": { "type": "string" }, "x2": { "type": "string" }, "y2": { "type": "string" }, "arrowHead": { "type": "string" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "create_section" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a section container (for organizing designs)".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" }, "color": { "type": "object" } } }),
+            });
+        }
+        "set_gradient_fill" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Apply a gradient fill to a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "type": { "type": "string" }, "stops": { "type": "string" }, "angle": { "type": "string" } } }),
+            });
+        }
+        "remove_fill" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Remove all fills from a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "remove_stroke" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Remove all strokes from a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "remove_effects" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Remove all effects from a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "copy_paste_style" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Copy styles from one node to another".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "sourceNodeId": { "type": "string" }, "targetNodeIds": { "type": "array", "items": { "type": "string" } } } }),
+            });
+        }
+        "create_prototype_link" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create an interaction link between frames".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "sourceFrameId": { "type": "string" }, "targetFrameId": { "type": "string" }, "trigger": { "type": "string" }, "transition": { "type": "string" }, "duration": { "type": "string" } } }),
+            });
+        }
+        "remove_prototype_link" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Remove prototype interaction from a node. Requires MCP server startup with --allow-destructive-tools and confirm=true".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "confirm": { "type": "boolean" }, "dryRun": { "type": "boolean" }, "reason": { "type": "string" } } }),
+            });
+        }
+        "set_prototype_start" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set a frame as the prototype starting point".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "frameId": { "type": "string" }, "flowName": { "type": "string" } } }),
+            });
+        }
+        "set_scroll_behavior" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set scroll behavior for a frame".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "frameId": { "type": "string" }, "direction": { "type": "string" } } }),
+            });
+        }
+        "set_clip_content" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set whether a frame clips content outside its bounds".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "clip": { "type": "string" } } }),
+            });
+        }
+        "create_variable" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new design variable".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "type": { "type": "string" }, "value": { "type": "string" }, "collectionId": { "type": "string" } } }),
+            });
+        }
+        "set_variable_value" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Update a variable's value".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "variableId": { "type": "string" }, "value": { "type": "string" } } }),
+            });
+        }
+        "apply_variable" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Apply a variable to a node property".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "variableId": { "type": "string" }, "property": { "type": "string" } } }),
+            });
+        }
+        "enable_library" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Enable a library for the current file".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "libraryId": { "type": "string" } } }),
+            });
+        }
+        "disable_library" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Disable a library for the current file".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "libraryId": { "type": "string" } } }),
+            });
+        }
+        "import_component_from_library" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Import a component from a team library".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "libraryId": { "type": "string" }, "componentKey": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" } } }),
+            });
+        }
+        "create_page" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Create a new page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "name": { "type": "string" }, "index": { "type": "string" } } }),
+            });
+        }
+        "delete_page" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Delete a page. Requires MCP server startup with --allow-destructive-tools and confirm=true".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" }, "confirm": { "type": "boolean" }, "dryRun": { "type": "boolean" }, "reason": { "type": "string" } } }),
+            });
+        }
+        "rename_page" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Rename a page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" }, "name": { "type": "string" } } }),
+            });
+        }
+        "duplicate_page" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Duplicate a page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" } } }),
+            });
+        }
+        "set_current_page" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Switch to a specific page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" } } }),
+            });
+        }
+        "set_page_background" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Set page background color".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" }, "color": { "type": "object" } } }),
+            });
+        }
+        "create_comment" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Add a comment to the canvas".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" }, "message": { "type": "string" }, "parentId": { "type": "string" } } }),
+            });
+        }
+        "get_comments" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get all comments on a page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "pageId": { "type": "string" } } }),
+            });
+        }
+        "resolve_comment" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Mark a comment as resolved".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "commentId": { "type": "string" } } }),
+            });
+        }
+        "delete_comment" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Delete a comment. Requires MCP server startup with --allow-destructive-tools and confirm=true".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "commentId": { "type": "string" }, "confirm": { "type": "boolean" }, "dryRun": { "type": "boolean" }, "reason": { "type": "string" } } }),
+            });
+        }
+        "select_all" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Select all nodes on the current page".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "type": { "type": "string" } } }),
+            });
+        }
+        "select_by_type" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Select all nodes of a specific type".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "type": { "type": "string" } } }),
+            });
+        }
+        "get_parent_chain" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get the parent hierarchy of a node".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "get_siblings" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Get sibling nodes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "is_node_visible" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Check if a node is visible in the viewport".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" } } }),
+            });
+        }
+        "duplicate_nodes" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Duplicate multiple nodes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeIds": { "type": "array", "items": { "type": "string" } }, "count": { "type": "string" }, "offsetX": { "type": "string" }, "offsetY": { "type": "string" } } }),
+            });
+        }
+        "delete_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Delete all selected nodes. Requires MCP server startup with --allow-destructive-tools and confirm=true".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "confirm": { "type": "boolean" }, "dryRun": { "type": "boolean" }, "reason": { "type": "string" } } }),
+            });
+        }
+        "align_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Align selected nodes".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "alignment": { "type": "string" } } }),
+            });
+        }
+        "distribute_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Distribute selected nodes evenly".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "direction": { "type": "string" }, "spacing": { "type": "string" } } }),
+            });
+        }
+        "resize_to_fit" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Resize a frame to fit its content".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "nodeId": { "type": "string" }, "padding": { "type": "number" } } }),
+            });
+        }
+        "scale_selection" => {
+            return Some(ToolDescription {
+                name: tool.to_string(),
+                description: "Scale selected nodes by a factor".to_string(),
+                input_schema: json!({ "type": "object", "properties": { "channel": { "type": "string" }, "scale": { "type": "string" } } }),
+            });
+        }
+        _ => {
+            None
+        }
+    }
+}
+fn get_tool_names() -> Vec<String> {
+    vec![
+        "join_channel".to_string(),
+        "get_document_info".to_string(),
+        "get_page_info".to_string(),
+        "get_selection".to_string(),
+        "set_selection".to_string(),
+        "get_node_info".to_string(),
+        "find_nodes_by_name".to_string(),
+        "create_frame".to_string(),
+        "create_rectangle".to_string(),
+        "create_ellipse".to_string(),
+        "create_text".to_string(),
+        "create_line".to_string(),
+        "delete_node".to_string(),
+        "set_node_name".to_string(),
+        "move_node".to_string(),
+        "resize_node".to_string(),
+        "set_fill".to_string(),
+        "set_stroke".to_string(),
+        "set_corner_radius".to_string(),
+        "set_effects".to_string(),
+        "set_auto_layout".to_string(),
+        "reorder_children".to_string(),
+        "create_component".to_string(),
+        "create_component_set".to_string(),
+        "create_instance".to_string(),
+        "detach_instance".to_string(),
+        "swap_component".to_string(),
+        "get_local_components".to_string(),
+        "reset_instance".to_string(),
+        "set_component_property".to_string(),
+        "set_constraints".to_string(),
+        "set_layout_grow".to_string(),
+        "export_node".to_string(),
+        "export_selection".to_string(),
+        "boolean_union".to_string(),
+        "boolean_subtract".to_string(),
+        "boolean_intersect".to_string(),
+        "boolean_exclude".to_string(),
+        "flatten_selection".to_string(),
+        "outline_stroke".to_string(),
+        "group_selection".to_string(),
+        "ungroup".to_string(),
+        "wrap_in_frame".to_string(),
+        "bring_to_front".to_string(),
+        "send_to_back".to_string(),
+        "bring_forward".to_string(),
+        "send_backward".to_string(),
+        "set_text_content".to_string(),
+        "set_font".to_string(),
+        "set_font_size".to_string(),
+        "set_font_weight".to_string(),
+        "set_line_height".to_string(),
+        "set_letter_spacing".to_string(),
+        "set_paragraph_spacing".to_string(),
+        "set_text_alignment".to_string(),
+        "set_text_decoration".to_string(),
+        "set_text_case".to_string(),
+        "set_text_auto_resize".to_string(),
+        "set_text_hyperlink".to_string(),
+        "get_font_list".to_string(),
+        "create_vector".to_string(),
+        "create_polygon".to_string(),
+        "create_star".to_string(),
+        "create_arrow".to_string(),
+        "create_section".to_string(),
+        "set_gradient_fill".to_string(),
+        "remove_fill".to_string(),
+        "remove_stroke".to_string(),
+        "remove_effects".to_string(),
+        "copy_paste_style".to_string(),
+        "create_prototype_link".to_string(),
+        "remove_prototype_link".to_string(),
+        "set_prototype_start".to_string(),
+        "get_prototype_flows".to_string(),
+        "set_scroll_behavior".to_string(),
+        "set_clip_content".to_string(),
+        "get_variables".to_string(),
+        "get_variable_collections".to_string(),
+        "create_variable".to_string(),
+        "set_variable_value".to_string(),
+        "apply_variable".to_string(),
+        "get_team_libraries".to_string(),
+        "enable_library".to_string(),
+        "disable_library".to_string(),
+        "import_component_from_library".to_string(),
+        "create_page".to_string(),
+        "delete_page".to_string(),
+        "rename_page".to_string(),
+        "duplicate_page".to_string(),
+        "set_current_page".to_string(),
+        "set_page_background".to_string(),
+        "create_comment".to_string(),
+        "get_comments".to_string(),
+        "resolve_comment".to_string(),
+        "delete_comment".to_string(),
+        "select_all".to_string(),
+        "select_by_type".to_string(),
+        "invert_selection".to_string(),
+        "get_parent_chain".to_string(),
+        "get_siblings".to_string(),
+        "is_node_visible".to_string(),
+        "duplicate_nodes".to_string(),
+        "delete_selection".to_string(),
+        "align_selection".to_string(),
+        "distribute_selection".to_string(),
+        "resize_to_fit".to_string(),
+        "scale_selection".to_string(),
+    ]
+}
